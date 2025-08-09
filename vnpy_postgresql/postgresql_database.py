@@ -114,7 +114,15 @@ class DbTickData(Model):
         database: PeeweePostgresqlDatabase = db
         indexes: tuple = ((("symbol", "exchange", "datetime"), True),)
 
+class DbSymbol(Model):
+    """Symbol metadata table mapping object"""
+    symbol = CharField()
+    exchange = CharField()
+    asset_class = CharField()
 
+    class Meta:
+        database = db
+        indexes = ((("symbol", "exchange"), True),)  # Unique constraint on (symbol, exchange)
 class DbBarOverview(Model):
     """K线汇总数据表映射对象"""
 
@@ -155,7 +163,7 @@ class PostgresqlDatabase(BaseDatabase):
         """"""
         self.db: PeeweePostgresqlDatabase = db
         self.db.connect(reuse_if_open=True)
-        self.db.create_tables([DbBarData, DbTickData, DbBarOverview, DbTickOverview])
+        self.db.create_tables([DbBarData, DbTickData, DbBarOverview, DbTickOverview, DbSymbol])
 
     def save_bar_data(self, bars: list[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
@@ -340,7 +348,25 @@ class PostgresqlDatabase(BaseDatabase):
         overview.save()
 
         return True
+    def save_symbol_info(self, symbol: str, exchange: Exchange, asset_class: str) -> None:
+        """Save or update symbol information"""
+        DbSymbol.insert({
+            DbSymbol.symbol: symbol,
+            DbSymbol.exchange: exchange.value,
+            DbSymbol.asset_class: asset_class
+        }).on_conflict(
+            update={DbSymbol.asset_class: asset_class},
+            conflict_target=(DbSymbol.symbol, DbSymbol.exchange)
+        ).execute()
 
+    def get_symbol_info(self, symbol: str, exchange: Exchange) -> dict | None:
+        """Retrieve symbol information"""
+        symbol_info = DbSymbol.get_or_none(
+            (DbSymbol.symbol == symbol) & (DbSymbol.exchange == exchange.value)
+        )
+        if symbol_info:
+            return {"asset_class": symbol_info.asset_class}
+        return None
     def load_bar_data(
         self,
         symbol: str,
@@ -349,8 +375,8 @@ class PostgresqlDatabase(BaseDatabase):
         start: datetime,
         end: datetime
     ) -> list[BarData]:
-        """读取K线数据"""
-        s: ModelSelect = (
+        """Load bar data"""
+        s = (
             DbBarData.select().where(
                 (DbBarData.symbol == symbol)
                 & (DbBarData.exchange == exchange.value)
@@ -360,9 +386,9 @@ class PostgresqlDatabase(BaseDatabase):
             ).order_by(DbBarData.datetime)
         )
 
-        bars: list[BarData] = []
+        bars = []
         for db_bar in s:
-            bar: BarData = BarData(
+            bar = BarData(
                 symbol=db_bar.symbol,
                 exchange=Exchange(db_bar.exchange),
                 datetime=datetime.fromtimestamp(db_bar.datetime.timestamp(), DB_TZ),
@@ -378,6 +404,12 @@ class PostgresqlDatabase(BaseDatabase):
             )
             bars.append(bar)
 
+        # Add asset class to extra field
+        symbol_info = self.get_symbol_info(symbol, exchange)
+        if symbol_info:
+            for bar in bars:
+                bar.extra = symbol_info.copy()
+
         return bars
 
     def load_tick_data(
@@ -387,8 +419,8 @@ class PostgresqlDatabase(BaseDatabase):
         start: datetime,
         end: datetime
     ) -> list[TickData]:
-        """读取TICK数据"""
-        s: ModelSelect = (
+        """Load tick data"""
+        s = (
             DbTickData.select().where(
                 (DbTickData.symbol == symbol)
                 & (DbTickData.exchange == exchange.value)
@@ -396,10 +428,10 @@ class PostgresqlDatabase(BaseDatabase):
                 & (DbTickData.datetime <= end)
             ).order_by(DbTickData.datetime)
         )
-
-        ticks: list[TickData] = []
+    
+        ticks = []
         for db_tick in s:
-            tick: TickData = TickData(
+            tick = TickData(
                 symbol=db_tick.symbol,
                 exchange=Exchange(db_tick.exchange),
                 datetime=datetime.fromtimestamp(db_tick.datetime.timestamp(), DB_TZ),
@@ -439,7 +471,13 @@ class PostgresqlDatabase(BaseDatabase):
                 gateway_name="DB"
             )
             ticks.append(tick)
-
+    
+        # Add asset class to extra field
+        symbol_info = self.get_symbol_info(symbol, exchange)
+        if symbol_info:
+            for tick in ticks:
+                tick.extra = symbol_info.copy()
+    
         return ticks
 
     def delete_bar_data(
