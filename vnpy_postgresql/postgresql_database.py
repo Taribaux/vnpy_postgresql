@@ -412,6 +412,79 @@ class PostgresqlDatabase(BaseDatabase):
 
         return bars
 
+    def load_bar_data_parallel(
+        self,
+        symbols: list[str],
+        exchanges: list[Exchange],
+        interval: Interval,
+        start: datetime,
+        end: datetime
+    ) -> list[BarData]:
+        from peewee import operator
+        from functools import reduce
+
+        # Return early if no symbols/exchanges are provided to avoid errors.
+        if not symbols:
+            return []
+
+        # Build a list of individual conditions for each (symbol, exchange) pair.
+        # e.g., ((DbBarData.symbol == 'AAPL') & (DbBarData.exchange == 'NASDAQ'))
+        conditions = []
+        for symbol, exchange in zip(symbols, exchanges):
+            condition = (
+                (DbBarData.symbol == symbol) &
+                (DbBarData.exchange == exchange.value)
+            )
+            conditions.append(condition)
+
+        # Use functools.reduce to cumulatively chain all conditions with an OR operator.
+        # This correctly builds the expression: (condition1 | condition2 | condition3 | ...)
+        combined_filter = reduce(operator.or_, conditions)
+
+        # Construct the final query
+        s = (
+            DbBarData.select()
+            .where(
+                combined_filter,
+                DbBarData.interval == interval.value,
+                DbBarData.datetime >= start,
+                DbBarData.datetime <= end
+            )
+            .order_by(DbBarData.symbol, DbBarData.datetime)
+        )
+
+        bars = []
+        # Pre-fetch symbol information for all requested pairs to optimize lookup.
+        symbol_info_map = {
+            (symbol, exchange.value): self.get_symbol_info(symbol, exchange)
+            for symbol, exchange in zip(symbols, exchanges)
+        }
+
+        for db_bar in s:
+            bar = BarData(
+                symbol=db_bar.symbol,
+                exchange=Exchange(db_bar.exchange),
+                datetime=datetime.fromtimestamp(db_bar.datetime.timestamp(), DB_TZ),
+                interval=Interval(db_bar.interval),
+                volume=db_bar.volume,
+                turnover=db_bar.turnover,
+                open_interest=db_bar.open_interest,
+                open_price=db_bar.open_price,
+                high_price=db_bar.high_price,
+                low_price=db_bar.low_price,
+                close_price=db_bar.close_price,
+                gateway_name="DB"
+            )
+
+            # Add asset class to the 'extra' field from the pre-fetched map.
+            info = symbol_info_map.get((bar.symbol, bar.exchange.value))
+            if info:
+                bar.extra = info.copy()
+
+            bars.append(bar)
+
+        return bars
+
     def load_tick_data(
         self,
         symbol: str,
